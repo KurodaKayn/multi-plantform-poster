@@ -10,177 +10,177 @@ physical_colocation_groups:
       - table: workspaces
         domain: tenant_core
         distribution_column: id
-        readiness: ready_after_constraint_review
+        readiness: reviewed_ready
         ddl: "create_distributed_table('workspaces', 'id')"
         notes: Root tenant table; the distributed value is the workspace UUID used by child workspace_id columns.
       - table: workspace_members
         domain: tenant_core
         distribution_column: workspace_id
-        readiness: ready_after_constraint_review
+        readiness: reviewed_ready
         ddl: "create_distributed_table('workspace_members', 'workspace_id', colocate_with => 'workspaces')"
         notes: Permission checks should remain shard-local with the workspace row.
       - table: workspace_invites
         domain: tenant_core
         distribution_column: workspace_id
-        readiness: target_after_unique_constraint_review
+        readiness: requires_unique_workspace_refactor
         ddl: "create_distributed_table('workspace_invites', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Token uniqueness must be reviewed before distribution.
+        notes: Token uniqueness must be made Citus-safe before distribution.
       - table: workspace_activities
         domain: tenant_core
         distribution_column: workspace_id
-        readiness: target_after_partition_constraint_review
+        readiness: requires_partition_workspace_refactor
         ddl: "create_distributed_table('workspace_activities', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Monthly partition primary key currently follows id and created_at.
+        notes: Monthly partition primary key currently follows id and created_at; Citus validation needs a workspace-compatible partition key strategy.
       - table: workspace_dashboard_stats
         domain: read_model
         distribution_column: workspace_id
-        readiness: ready_after_constraint_review
+        readiness: reviewed_ready
         ddl: "create_distributed_table('workspace_dashboard_stats', 'workspace_id', colocate_with => 'workspaces')"
         notes: Workspace-scoped aggregate read model.
       - table: notifications
         domain: tenant_core
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('notifications', 'workspace_id', colocate_with => 'workspaces')"
-        notes: User notification fan-out stays tenant-local; cross-workspace inboxes need read-model aggregation.
+        notes: User notification fan-out stays tenant-local; the id primary key needs workspace routing before distribution, and cross-workspace inboxes need read-model aggregation.
       - table: workspace_quota_aggregates
         domain: metering
         distribution_column: workspace_id
-        readiness: ready_after_constraint_review
+        readiness: reviewed_ready
         ddl: "create_distributed_table('workspace_quota_aggregates', 'workspace_id', colocate_with => 'workspaces')"
         notes: Workspace quota row is naturally keyed by workspace_id.
       - table: ai_usage_records
         domain: metering
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('ai_usage_records', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Usage history is tenant-local and can aggregate into workspace_quota_aggregates.
+        notes: Usage history is tenant-local and can aggregate into workspace_quota_aggregates; the id primary key needs workspace routing before distribution.
       - table: projects
         domain: project
         distribution_column: workspace_id
-        readiness: target_after_unique_constraint_review
+        readiness: requires_unique_workspace_refactor
         ddl: "create_distributed_table('projects', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Primary project row; project_id-only uniqueness must be reviewed before distribution.
+        notes: Primary project row; id primary key and collab-document uniqueness need workspace routing before distribution.
       - table: project_platform_publications
         domain: project
         distribution_column: workspace_id
-        readiness: target_after_unique_constraint_review
+        readiness: requires_unique_workspace_refactor
         ddl: "create_distributed_table('project_platform_publications', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Draft/status rows should colocate with projects; project/platform uniqueness needs workspace_id.
+        notes: Draft/status rows should colocate with projects; id primary key and project/platform uniqueness need workspace_id.
       - table: project_list_summaries
         domain: read_model
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('project_list_summaries', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Dashboard list read model follows the project workspace.
+        notes: Dashboard list read model follows the project workspace; the project_id primary key needs workspace routing before distribution.
       - table: project_activities
         domain: project
         distribution_column: workspace_id
-        readiness: target_after_partition_constraint_review
+        readiness: requires_partition_workspace_refactor
         ddl: "create_distributed_table('project_activities', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Monthly partition primary key currently follows id and created_at.
+        notes: Monthly partition primary key currently follows id and created_at; Citus validation needs a workspace-compatible partition key strategy.
       - table: project_comments
         domain: project
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('project_comments', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Comment reads and writes should remain local to the project workspace.
+        notes: Comment reads and writes should remain local to the project workspace; the id primary key needs workspace routing before distribution.
       - table: project_versions
         domain: project
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('project_versions', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Version history should colocate with projects and collaboration state.
+        notes: Version history should colocate with projects and collaboration state; the id primary key needs workspace routing before distribution.
       - table: project_share_links
         domain: project
         distribution_column: workspace_id
-        readiness: target_after_unique_constraint_review
+        readiness: requires_unique_workspace_refactor
         ddl: "create_distributed_table('project_share_links', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Token uniqueness must be reviewed before distribution.
+        notes: Token uniqueness must be made Citus-safe before distribution.
       - table: scheduled_publications
         domain: publishing
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('scheduled_publications', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Scheduled publishing workers should route by workspace_id.
+        notes: Scheduled publishing workers route by workspace_id; the id primary key needs workspace routing before distribution.
       - table: publish_events
         domain: publishing
         distribution_column: workspace_id
-        readiness: target_after_partition_constraint_review
+        readiness: requires_partition_workspace_refactor
         ddl: "create_distributed_table('publish_events', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Monthly partition primary key currently follows id and created_at.
+        notes: Monthly partition primary key currently follows id and created_at; Citus validation needs a workspace-compatible partition key strategy.
       - table: extension_callback_tokens
         domain: extension
         distribution_column: workspace_id
-        readiness: target_after_unique_constraint_review
+        readiness: requires_unique_workspace_refactor
         ddl: "create_distributed_table('extension_callback_tokens', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Token uniqueness must be reviewed before distribution.
+        notes: Token uniqueness must be made Citus-safe before distribution.
       - table: extension_execution_events
         domain: extension
         distribution_column: workspace_id
-        readiness: target_after_partition_constraint_review
+        readiness: requires_partition_workspace_refactor
         ddl: "create_distributed_table('extension_execution_events', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Monthly partition primary key currently follows id and created_at.
+        notes: Monthly partition primary key currently follows id and created_at; Citus validation needs a workspace-compatible partition key strategy.
       - table: media_assets
         domain: media
         distribution_column: workspace_id
-        readiness: target_after_unique_constraint_review
+        readiness: requires_unique_workspace_refactor
         ddl: "create_distributed_table('media_assets', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Object key uniqueness must be reviewed; object bytes stay in R2/S3.
+        notes: Object key uniqueness must be made Citus-safe; object bytes stay in R2/S3.
       - table: media_asset_usages
         domain: media
         distribution_column: workspace_id
-        readiness: target_after_unique_constraint_review
+        readiness: requires_unique_workspace_refactor
         ddl: "create_distributed_table('media_asset_usages', 'workspace_id', colocate_with => 'workspaces')"
         notes: Asset/resource uniqueness must include workspace routing before distribution.
       - table: brand_profiles
         domain: content_setup
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('brand_profiles', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Workspace-owned brand profiles should colocate with projects and AI context.
+        notes: Workspace-owned brand profiles should colocate with projects and AI context; the id primary key needs workspace routing before distribution.
       - table: collab_documents
         domain: collaboration
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('collab_documents', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Collaboration document metadata follows the workspace tenant.
+        notes: Collaboration document metadata follows the workspace tenant; the id primary key needs workspace routing before distribution.
       - table: collab_document_states
         domain: collaboration
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('collab_document_states', 'workspace_id', colocate_with => 'workspaces')"
-        notes: State snapshots should colocate with their document metadata.
+        notes: State snapshots should colocate with their document metadata; the document_id primary key needs workspace routing before distribution.
       - table: collab_document_update_batches
         domain: collaboration
         distribution_column: workspace_id
-        readiness: target_after_partition_constraint_review
+        readiness: requires_partition_workspace_refactor
         ddl: "create_distributed_table('collab_document_update_batches', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Existing document_id hash partitioning must be rehearsed with Citus partitioned-table support.
+        notes: Existing document_id hash partitioning must be rehearsed with Citus partitioned-table support and workspace-compatible uniqueness.
       - table: ai_context_snapshots
         domain: ai
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('ai_context_snapshots', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Context snapshots follow the owning project workspace.
+        notes: Context snapshots follow the owning project workspace; the id primary key needs workspace routing before distribution.
       - table: ai_growth_optimization_runs
         domain: ai
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('ai_growth_optimization_runs', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Growth runs should colocate with snapshots and proposals.
+        notes: Growth runs should colocate with snapshots and proposals; the id primary key needs workspace routing before distribution.
       - table: ai_proposals
         domain: ai
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('ai_proposals', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Proposal decisions should stay shard-local with the project.
+        notes: Proposal decisions should stay shard-local with the project; the id primary key needs workspace routing before distribution.
       - table: ai_drafting_sessions
         domain: ai
         distribution_column: workspace_id
-        readiness: target_after_constraint_review
+        readiness: requires_pk_workspace_refactor
         ddl: "create_distributed_table('ai_drafting_sessions', 'workspace_id', colocate_with => 'workspaces')"
-        notes: Drafting sessions are the parent route for AI chat child rows.
+        notes: Drafting sessions are the parent route for AI chat child rows; the id primary key needs workspace routing before distribution.
 reference_tables:
   - table: users
     readiness: reference_candidate_for_validation
@@ -198,7 +198,7 @@ control_domain_tables:
   - table: remote_browser_sessions
     reason: Short-lived runtime state is governed by Redis and monthly archive paths before Citus.
   - table: outbox_events
-    reason: Queue dispatch remains coordinator/control-domain state until worker payloads carry workspace_id.
+    reason: Queue dispatch remains coordinator/control-domain state; publish worker payloads now carry workspace_id, but outbox_events has no relational routing column yet.
   - table: extension_execution_event_claims
     reason: Global idempotency claim table does not have workspace routing today.
 deferred_colocation_tables:
