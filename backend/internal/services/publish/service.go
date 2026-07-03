@@ -491,10 +491,6 @@ func (s *Service) recordPublishEvent(event models.PublishEvent) error {
 	return s.writerDB(s.requestContext()).Create(&event).Error
 }
 
-func (s *Service) recordProjectPublishActivity(projectID uuid.UUID, userID uuid.UUID, eventType string, metadata map[string]any) error {
-	return s.recordProjectPublishActivityForWorkspace(uuid.Nil, projectID, userID, eventType, metadata)
-}
-
 func (s *Service) recordProjectPublishActivityForWorkspace(workspaceID uuid.UUID, projectID uuid.UUID, userID uuid.UUID, eventType string, metadata map[string]any) error {
 	if projectID == uuid.Nil || userID == uuid.Nil || strings.TrimSpace(eventType) == "" {
 		return nil
@@ -524,10 +520,6 @@ func (s *Service) recordProjectPublishActivityForWorkspace(workspaceID uuid.UUID
 		EventType:   eventType,
 		Metadata:    payload,
 	}).Error
-}
-
-func (s *Service) findIdempotentPublishResponse(projectID uuid.UUID, platform string, userID uuid.UUID, key string) (PublishResponse, bool, error) {
-	return s.findIdempotentPublishResponseForWorkspace(uuid.Nil, projectID, platform, userID, key)
 }
 
 func (s *Service) findIdempotentPublishResponseForWorkspace(workspaceID uuid.UUID, projectID uuid.UUID, platform string, userID uuid.UUID, key string) (PublishResponse, bool, error) {
@@ -605,10 +597,6 @@ func publishEventReplayRank(eventType string) int {
 	default:
 		return 0
 	}
-}
-
-func (s *Service) waitForIdempotentPublishResponse(ctx context.Context, projectID uuid.UUID, platform string, userID uuid.UUID, key string) (PublishResponse, bool, error) {
-	return s.waitForIdempotentPublishResponseForWorkspace(ctx, uuid.Nil, projectID, platform, userID, key)
 }
 
 func (s *Service) waitForIdempotentPublishResponseForWorkspace(ctx context.Context, workspaceID uuid.UUID, projectID uuid.UUID, platform string, userID uuid.UUID, key string) (PublishResponse, bool, error) {
