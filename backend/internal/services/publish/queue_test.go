@@ -407,6 +407,7 @@ func TestEnqueuePublishProjectQueuesAndLocksPublication(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, models.PublicationStatusQueued, resp.Status)
 	require.Len(t, queue.jobs, 1)
+	require.Equal(t, models.PersonalWorkspaceID(user.ID), queue.jobs[0].WorkspaceID)
 	require.Equal(t, uuid.Nil, queue.jobs[0].BrowserSessionID)
 
 	lockKey := publishLockKey(project.ID, "wechat")
@@ -419,6 +420,9 @@ func TestEnqueuePublishProjectQueuesAndLocksPublication(t *testing.T) {
 	require.Equal(t, models.OutboxStatusDispatched, outbox.Status)
 	require.Equal(t, 1, outbox.Attempts)
 	require.NotNil(t, outbox.ProcessedAt)
+	var outboxJob PublishJob
+	require.NoError(t, json.Unmarshal(outbox.Payload, &outboxJob))
+	require.Equal(t, models.PersonalWorkspaceID(user.ID), outboxJob.WorkspaceID)
 
 	var saved models.ProjectPlatformPublication
 	require.NoError(t, db.First(&saved, "project_id = ? AND platform = ?", project.ID, "wechat").Error)
@@ -844,6 +848,7 @@ func TestEnqueuePublishProjectLeavesFailedDispatchInOutboxForRetry(t *testing.T)
 	require.NoError(t, service.FlushPublishOutbox(context.Background(), 10))
 	require.Len(t, queue.jobs, 1)
 	require.Equal(t, resp.JobID, queue.jobs[0].JobID.String())
+	require.Equal(t, models.PersonalWorkspaceID(user.ID), queue.jobs[0].WorkspaceID)
 
 	require.NoError(t, db.First(&outbox, "id = ?", outbox.ID).Error)
 	require.Equal(t, models.OutboxStatusDispatched, outbox.Status)
@@ -857,14 +862,36 @@ func TestFlushPublishOutboxRetriesStaleProcessingEvent(t *testing.T) {
 	queue := newTestPublishQueue()
 	service.queue = queue
 
+	user := models.User{Username: "legacy-outbox-owner"}
+	require.NoError(t, db.Create(&user).Error)
+	project := models.Project{
+		UserID:        user.ID,
+		Title:         "Legacy queued post",
+		SourceContent: "<p>ready</p>",
+		Status:        models.ProjectStatusReady,
+	}
+	require.NoError(t, db.Create(&project).Error)
+
 	job := PublishJob{
 		JobID:      uuid.New(),
-		ProjectID:  uuid.New(),
-		UserID:     uuid.New(),
+		ProjectID:  project.ID,
+		UserID:     user.ID,
 		Platform:   "wechat",
 		EnqueuedAt: time.Now().UTC(),
 	}
-	payload, err := json.Marshal(job)
+	payload, err := json.Marshal(struct {
+		JobID      uuid.UUID `json:"job_id"`
+		ProjectID  uuid.UUID `json:"project_id"`
+		UserID     uuid.UUID `json:"user_id"`
+		Platform   string    `json:"platform"`
+		EnqueuedAt time.Time `json:"enqueued_at"`
+	}{
+		JobID:      job.JobID,
+		ProjectID:  job.ProjectID,
+		UserID:     job.UserID,
+		Platform:   job.Platform,
+		EnqueuedAt: job.EnqueuedAt,
+	})
 	require.NoError(t, err)
 	staleUpdatedAt := time.Now().UTC().Add(-publishOutboxClaimTimeout - time.Second)
 	outbox := models.OutboxEvent{
@@ -882,6 +909,7 @@ func TestFlushPublishOutboxRetriesStaleProcessingEvent(t *testing.T) {
 	require.NoError(t, service.FlushPublishOutbox(context.Background(), 10))
 
 	require.Len(t, queue.jobs, 1)
+	job.WorkspaceID = models.PersonalWorkspaceID(user.ID)
 	require.Equal(t, job, queue.jobs[0])
 	require.NoError(t, db.First(&outbox, "id = ?", outbox.ID).Error)
 	require.Equal(t, models.OutboxStatusDispatched, outbox.Status)
@@ -1164,6 +1192,58 @@ func TestProcessPublishJobPublishesAndReleasesLock(t *testing.T) {
 	require.Equal(t, []publishJobObservation{
 		{platform: "wechat", result: publishJobResultSuccess},
 	}, observer.observations)
+}
+
+func TestProcessPublishJobRejectsWorkspaceMismatch(t *testing.T) {
+	db := setupPublishQueueTestDB(t)
+	service := newPublishTestService(db)
+	queue := newTestPublishQueue()
+	service.queue = queue
+
+	publisher.Factory.Register("wechat", queueTestPublisher{})
+	defer publisher.Factory.Register("wechat", &publisher.WechatPublisher{})
+
+	user := models.User{Username: "owner"}
+	require.NoError(t, db.Create(&user).Error)
+	project := models.Project{
+		UserID:        user.ID,
+		Title:         "Queued post",
+		SourceContent: "<p>ready</p>",
+		Status:        models.ProjectStatusReady,
+	}
+	require.NoError(t, db.Create(&project).Error)
+	createConnectedQueueAccount(t, db, user.ID, "wechat")
+	require.NoError(t, db.Create(&models.ProjectPlatformPublication{
+		ProjectID:      project.ID,
+		Platform:       "wechat",
+		Enabled:        true,
+		Status:         models.PublicationStatusPublishing,
+		Config:         datatypes.JSON(`{"title":"Queued post"}`),
+		AdaptedContent: datatypes.JSON(`{"format":"html","html":"ready"}`),
+	}).Error)
+
+	wrongWorkspaceID := uuid.New()
+	job := PublishJob{
+		JobID:       uuid.New(),
+		ProjectID:   project.ID,
+		WorkspaceID: wrongWorkspaceID,
+		UserID:      user.ID,
+		Platform:    "wechat",
+		EnqueuedAt:  time.Now().UTC(),
+	}
+	lockKey := publishLockKey(project.ID, "wechat")
+	queue.locks[lockKey] = job.JobID.String()
+
+	require.NoError(t, service.processPublishJob(context.Background(), job))
+
+	var saved models.ProjectPlatformPublication
+	require.NoError(t, db.First(&saved, "project_id = ? AND platform = ?", project.ID, "wechat").Error)
+	require.Equal(t, models.PublicationStatusPublishing, saved.Status)
+	require.Empty(t, queue.locks[lockKey])
+
+	var wrongWorkspaceEvents int64
+	require.NoError(t, db.Model(&models.PublishEvent{}).Where("workspace_id = ?", wrongWorkspaceID).Count(&wrongWorkspaceEvents).Error)
+	require.Zero(t, wrongWorkspaceEvents)
 }
 
 func TestProcessPublishJobReacquiresExpiredLock(t *testing.T) {
@@ -1476,6 +1556,7 @@ func TestRedisPublishQueueEnqueuesAsynqTask(t *testing.T) {
 	var payload PublishJob
 	require.NoError(t, json.Unmarshal(tasks[0].Payload, &payload))
 	require.Equal(t, job, payload)
+	require.Contains(t, string(tasks[0].Payload), `"workspace_id"`)
 }
 
 func TestStartPublishWorkerWithErrorsReportsRunnerFailure(t *testing.T) {
