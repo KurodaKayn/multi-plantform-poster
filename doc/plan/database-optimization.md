@@ -134,7 +134,7 @@ Atomic commit guidance:
 
 #### Phase 6: Citus Distributed PostgreSQL Operation
 
-- [ ] Set up a Citus validation cluster when horizontal scaling is actually needed.
+- [ ] Set up a Citus validation cluster when horizontal scaling is actually needed, with coordinator/worker topology, tenant colocation DDL, reference-table rehearsal, and rollback/rebuild runbook documented before real tenant migration.
 - [ ] Import synthetic or new workspaces for validation.
 - [ ] Configure PgBouncer, monitoring, backup, and failure drills for Citus coordinator/workers.
 - [ ] Govern worker concurrency by `workspace_id`.
@@ -523,7 +523,9 @@ Goal: operate Citus as a future PostgreSQL-compatible distributed runtime for ne
 
 Work items:
 
-- Set up a Citus validation cluster when horizontal scaling is actually needed.
+- Set up a Citus validation cluster only after horizontal scaling is justified, using a non-production coordinator and at least two worker nodes.
+- Apply the reviewed Phase 5 DDL shape in the validation cluster: distribute `workspaces` first, colocate tenant tables by `workspace_id`, rehearse `users` and small global dimensions as reference-table candidates, and keep control-domain tables outside the distributed group until a routing boundary requires otherwise.
+- Document the validation cluster bootstrap, rollback, rebuild, backup-restore, and teardown runbooks before importing any real tenant data.
 - Import synthetic or new workspaces for validation, checking colocated joins, publishing-state transitions, collaborative editing, and dashboard read models.
 - Configure PgBouncer, backups, monitoring, capacity thresholds, and failure drills separately for Citus coordinator and worker nodes.
 - Apply Asynq worker concurrency limits by `workspace_id` and Citus cluster capacity, so single-tenant tasks do not overwhelm workers or the database.
