@@ -270,6 +270,10 @@ func (s *Service) PublishProject(projectID uuid.UUID, platform string, scopeUser
 }
 
 func (s *Service) PublishProjectWithContext(ctx context.Context, projectID uuid.UUID, platform string, scopeUserID *uuid.UUID, scheduleID uuid.UUID) (PublishResponse, error) {
+	return s.PublishProjectInWorkspaceWithContext(ctx, uuid.Nil, projectID, platform, scopeUserID, scheduleID)
+}
+
+func (s *Service) PublishProjectInWorkspaceWithContext(ctx context.Context, workspaceID uuid.UUID, projectID uuid.UUID, platform string, scopeUserID *uuid.UUID, scheduleID uuid.UUID) (PublishResponse, error) {
 	// Remote browser sessions are only for account connection and cookie capture.
 	// Publish jobs must be durable across Redis workers, so they load saved credentials instead.
 	if ctx == nil {
@@ -284,9 +288,15 @@ func (s *Service) PublishProjectWithContext(ctx context.Context, projectID uuid.
 	if err != nil {
 		return PublishResponse{}, err
 	}
+	projectWorkspaceID := models.ProjectWorkspaceID(proj)
+	if workspaceID == uuid.Nil {
+		workspaceID = projectWorkspaceID
+	} else if workspaceID != projectWorkspaceID {
+		return PublishResponse{}, ErrForbidden
+	}
 
 	var pub models.ProjectPlatformPublication
-	if err := s.strongReadDB(ctx).Where("project_id = ? AND platform = ?", projectID, platform).First(&pub).Error; err != nil {
+	if err := s.strongReadDB(ctx).Where("workspace_id = ? AND project_id = ? AND platform = ?", workspaceID, projectID, platform).First(&pub).Error; err != nil {
 		return PublishResponse{}, fmt.Errorf("publication record not found for platform: %s", platform)
 	}
 	if !pub.Enabled || pub.Status == models.PublicationStatusCancelled {
@@ -295,13 +305,13 @@ func (s *Service) PublishProjectWithContext(ctx context.Context, projectID uuid.
 
 	startedAt := time.Now().UTC()
 	lifecycle := s.lifecycle()
-	attempt, hasAttempt, err := lifecycle.StartPublishAttempt(scheduleID, startedAt)
+	attempt, hasAttempt, err := lifecycle.StartPublishAttemptForWorkspace(workspaceID, scheduleID, startedAt)
 	if err != nil {
 		return PublishResponse{}, err
 	}
 	failAttempt := func(err error) error {
 		if hasAttempt {
-			_ = lifecycle.FinishPublishAttempt(&attempt, publishAttemptCompletion{
+			_ = lifecycle.FinishPublishAttemptForWorkspace(workspaceID, &attempt, publishAttemptCompletion{
 				Status:       models.PublishAttemptStatusFailed,
 				ErrorMessage: SanitizeUserFacingErrorMessage(err.Error()),
 			})
@@ -330,7 +340,7 @@ func (s *Service) PublishProjectWithContext(ctx context.Context, projectID uuid.
 
 	var account models.PlatformAccount
 	if pub.PlatformAccountID != nil && *pub.PlatformAccountID != uuid.Nil {
-		if err := s.strongReadDB(ctx).Where("id = ?", *pub.PlatformAccountID).First(&account).Error; err != nil {
+		if err := s.strongReadDB(ctx).Where("id = ? AND workspace_id = ?", *pub.PlatformAccountID, workspaceID).First(&account).Error; err != nil {
 			return PublishResponse{}, err
 		}
 	}
@@ -391,7 +401,7 @@ func (s *Service) PublishProjectWithContext(ctx context.Context, projectID uuid.
 		attemptStatus = models.PublishAttemptStatusFailed
 	}
 	if hasAttempt {
-		if err := lifecycle.FinishPublishAttempt(&attempt, publishAttemptCompletion{
+		if err := lifecycle.FinishPublishAttemptForWorkspace(workspaceID, &attempt, publishAttemptCompletion{
 			Status:       attemptStatus,
 			RemoteID:     remoteID,
 			PublishURL:   publishURL,
@@ -401,7 +411,7 @@ func (s *Service) PublishProjectWithContext(ctx context.Context, projectID uuid.
 		}
 	}
 	s.invalidateDashboardCaches(ctx)
-	if err := s.recordProjectPublishActivity(projectID, *scopeUserID, models.ProjectActivityPublishCompleted, map[string]any{
+	if err := s.recordProjectPublishActivityForWorkspace(workspaceID, projectID, *scopeUserID, models.ProjectActivityPublishCompleted, map[string]any{
 		"platform":  platform,
 		"status":    status,
 		"remote_id": remoteID,
@@ -482,12 +492,22 @@ func (s *Service) recordPublishEvent(event models.PublishEvent) error {
 }
 
 func (s *Service) recordProjectPublishActivity(projectID uuid.UUID, userID uuid.UUID, eventType string, metadata map[string]any) error {
+	return s.recordProjectPublishActivityForWorkspace(uuid.Nil, projectID, userID, eventType, metadata)
+}
+
+func (s *Service) recordProjectPublishActivityForWorkspace(workspaceID uuid.UUID, projectID uuid.UUID, userID uuid.UUID, eventType string, metadata map[string]any) error {
 	if projectID == uuid.Nil || userID == uuid.Nil || strings.TrimSpace(eventType) == "" {
 		return nil
 	}
 	var project models.Project
 	if err := s.writerDB(s.requestContext()).Select("id", "user_id", "workspace_id").First(&project, "id = ?", projectID).Error; err != nil {
 		return err
+	}
+	projectWorkspaceID := models.ProjectWorkspaceID(project)
+	if workspaceID == uuid.Nil {
+		workspaceID = projectWorkspaceID
+	} else if workspaceID != projectWorkspaceID {
+		return ErrForbidden
 	}
 	payload := datatypes.JSON([]byte(`{}`))
 	if metadata != nil {
@@ -498,7 +518,7 @@ func (s *Service) recordProjectPublishActivity(projectID uuid.UUID, userID uuid.
 		payload = datatypes.JSON(encoded)
 	}
 	return s.writerDB(s.requestContext()).Create(&models.ProjectActivity{
-		WorkspaceID: models.ProjectWorkspaceID(project),
+		WorkspaceID: workspaceID,
 		ProjectID:   projectID,
 		ActorUserID: userID,
 		EventType:   eventType,
@@ -507,6 +527,10 @@ func (s *Service) recordProjectPublishActivity(projectID uuid.UUID, userID uuid.
 }
 
 func (s *Service) findIdempotentPublishResponse(projectID uuid.UUID, platform string, userID uuid.UUID, key string) (PublishResponse, bool, error) {
+	return s.findIdempotentPublishResponseForWorkspace(uuid.Nil, projectID, platform, userID, key)
+}
+
+func (s *Service) findIdempotentPublishResponseForWorkspace(workspaceID uuid.UUID, projectID uuid.UUID, platform string, userID uuid.UUID, key string) (PublishResponse, bool, error) {
 	if strings.TrimSpace(key) == "" {
 		return PublishResponse{}, false, nil
 	}
@@ -516,9 +540,11 @@ func (s *Service) findIdempotentPublishResponse(projectID uuid.UUID, platform st
 	}
 
 	var queued models.PublishEvent
-	err := db.
+	query := db.
+		Scopes(workspaceScope(workspaceID)).
 		Where("project_id = ? AND platform = ? AND user_id = ? AND idempotency_key = ? AND event_type = ?", projectID, platform, userID, key, "queued").
-		Order("created_at DESC").
+		Order("created_at DESC")
+	err := query.
 		First(&queued).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return PublishResponse{}, false, nil
@@ -530,6 +556,7 @@ func (s *Service) findIdempotentPublishResponse(projectID uuid.UUID, platform st
 	event := queued
 	var events []models.PublishEvent
 	err = db.
+		Scopes(workspaceScope(workspaceID)).
 		Where("project_id = ? AND platform = ? AND user_id = ? AND job_id = ?", projectID, platform, userID, queued.JobID).
 		Order("created_at ASC").
 		Find(&events).Error
@@ -581,6 +608,10 @@ func publishEventReplayRank(eventType string) int {
 }
 
 func (s *Service) waitForIdempotentPublishResponse(ctx context.Context, projectID uuid.UUID, platform string, userID uuid.UUID, key string) (PublishResponse, bool, error) {
+	return s.waitForIdempotentPublishResponseForWorkspace(ctx, uuid.Nil, projectID, platform, userID, key)
+}
+
+func (s *Service) waitForIdempotentPublishResponseForWorkspace(ctx context.Context, workspaceID uuid.UUID, projectID uuid.UUID, platform string, userID uuid.UUID, key string) (PublishResponse, bool, error) {
 	deadline := time.NewTimer(publishReplayWait)
 	defer deadline.Stop()
 
@@ -588,7 +619,7 @@ func (s *Service) waitForIdempotentPublishResponse(ctx context.Context, projectI
 	defer ticker.Stop()
 
 	for {
-		resp, ok, err := s.findIdempotentPublishResponse(projectID, platform, userID, key)
+		resp, ok, err := s.findIdempotentPublishResponseForWorkspace(workspaceID, projectID, platform, userID, key)
 		if err != nil || ok {
 			return resp, ok, err
 		}

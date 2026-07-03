@@ -41,12 +41,14 @@ var (
 	ErrPublicationAlreadyPublishing = errors.New("publication is already publishing")
 	ErrPublishQueueEmpty            = errors.New("publish queue empty")
 	errPublishLockOwnershipLost     = errors.New("publish lock ownership lost")
+	errPublishJobWorkspaceMismatch  = errors.New("publish job workspace does not match project")
 	publishLockRefreshInterval      = publishLockRefreshEvery
 )
 
 type PublishJob struct {
 	JobID          uuid.UUID `json:"job_id"`
 	ProjectID      uuid.UUID `json:"project_id"`
+	WorkspaceID    uuid.UUID `json:"workspace_id"`
 	UserID         uuid.UUID `json:"user_id"`
 	Platform       string    `json:"platform"`
 	PublicationID  uuid.UUID `json:"publication_id,omitempty"`
@@ -197,18 +199,22 @@ func (s *Service) EnqueuePublishProject(ctx context.Context, projectID uuid.UUID
 		return PublishResponse{}, ErrForbidden
 	}
 	req.IdempotencyKey = normalizeIdempotencyKey(req.IdempotencyKey)
+	project, projectErr := s.projectForPublish(ctx, projectID, *scopeUserID)
+	if projectErr != nil {
+		return PublishResponse{}, projectErr
+	}
+	workspaceID := models.ProjectWorkspaceID(project)
 	if req.IdempotencyKey != "" {
-		if resp, ok, err := s.findIdempotentPublishResponse(projectID, platform, *scopeUserID, req.IdempotencyKey); err != nil {
+		if resp, ok, err := s.findIdempotentPublishResponseForWorkspace(workspaceID, project.ID, platform, *scopeUserID, req.IdempotencyKey); err != nil {
 			return PublishResponse{}, err
 		} else if ok {
 			return resp, nil
 		}
 	}
-
-	project, pub, err := s.preparePublishJob(ctx, projectID, platform, *scopeUserID)
+	project, pub, err := s.preparePublishJobForProject(ctx, project, platform, *scopeUserID)
 	if err != nil {
 		if req.IdempotencyKey != "" {
-			if resp, ok, lookupErr := s.findIdempotentPublishResponse(projectID, platform, *scopeUserID, req.IdempotencyKey); lookupErr != nil {
+			if resp, ok, lookupErr := s.findIdempotentPublishResponseForWorkspace(workspaceID, project.ID, platform, *scopeUserID, req.IdempotencyKey); lookupErr != nil {
 				return PublishResponse{}, lookupErr
 			} else if ok {
 				return resp, nil
@@ -223,7 +229,7 @@ func (s *Service) EnqueuePublishProject(ctx context.Context, projectID uuid.UUID
 		if err != nil {
 			return PublishResponse{}, err
 		}
-		resp, err := s.PublishProjectWithContext(ctx, projectID, platform, scopeUserID, schedule.ID)
+		resp, err := s.PublishProjectInWorkspaceWithContext(ctx, workspaceID, project.ID, platform, scopeUserID, schedule.ID)
 		if err != nil {
 			return PublishResponse{}, err
 		}
@@ -237,6 +243,7 @@ func (s *Service) EnqueuePublishProject(ctx context.Context, projectID uuid.UUID
 	job := PublishJob{
 		JobID:          uuid.New(),
 		ProjectID:      project.ID,
+		WorkspaceID:    workspaceID,
 		UserID:         *scopeUserID,
 		Platform:       platform,
 		PublicationID:  pub.ID,
@@ -254,7 +261,7 @@ func (s *Service) EnqueuePublishProject(ctx context.Context, projectID uuid.UUID
 	}
 	if !acquired {
 		if req.IdempotencyKey != "" {
-			if resp, ok, err := s.waitForIdempotentPublishResponse(ctx, project.ID, platform, *scopeUserID, req.IdempotencyKey); err != nil {
+			if resp, ok, err := s.waitForIdempotentPublishResponseForWorkspace(ctx, workspaceID, project.ID, platform, *scopeUserID, req.IdempotencyKey); err != nil {
 				return PublishResponse{}, err
 			} else if ok {
 				return resp, nil
@@ -277,6 +284,7 @@ func (s *Service) EnqueuePublishProject(ctx context.Context, projectID uuid.UUID
 		job.ScheduleID = schedule.ID
 		if err := txService.recordPublishEvent(models.PublishEvent{
 			PublicationID:  pub.ID,
+			WorkspaceID:    job.WorkspaceID,
 			ProjectID:      project.ID,
 			UserID:         *scopeUserID,
 			Platform:       platform,
@@ -287,7 +295,7 @@ func (s *Service) EnqueuePublishProject(ctx context.Context, projectID uuid.UUID
 		}); err != nil {
 			return err
 		}
-		if err := txService.recordProjectPublishActivity(project.ID, *scopeUserID, models.ProjectActivityPublishRequested, map[string]any{
+		if err := txService.recordProjectPublishActivityForWorkspace(job.WorkspaceID, project.ID, *scopeUserID, models.ProjectActivityPublishRequested, map[string]any{
 			"platform": platform,
 			"job_id":   job.JobID.String(),
 		}); err != nil {
@@ -298,6 +306,7 @@ func (s *Service) EnqueuePublishProject(ctx context.Context, projectID uuid.UUID
 		}
 		if err := txService.recordPublishEvent(models.PublishEvent{
 			PublicationID:  pub.ID,
+			WorkspaceID:    job.WorkspaceID,
 			ProjectID:      project.ID,
 			UserID:         *scopeUserID,
 			Platform:       platform,
@@ -308,7 +317,7 @@ func (s *Service) EnqueuePublishProject(ctx context.Context, projectID uuid.UUID
 		}); err != nil {
 			return err
 		}
-		if err := txService.recordProjectPublishActivity(project.ID, *scopeUserID, models.ProjectActivityPublishQueued, map[string]any{
+		if err := txService.recordProjectPublishActivityForWorkspace(job.WorkspaceID, project.ID, *scopeUserID, models.ProjectActivityPublishQueued, map[string]any{
 			"platform": platform,
 			"job_id":   job.JobID.String(),
 		}); err != nil {
@@ -397,7 +406,18 @@ func (s *Service) StartPublishWorkerWithErrors(ctx context.Context) <-chan error
 }
 
 func (s *Service) processPublishJob(ctx context.Context, job PublishJob) error {
-	if job.JobID == uuid.Nil || job.ProjectID == uuid.Nil || job.UserID == uuid.Nil || strings.TrimSpace(job.Platform) == "" {
+	if err := s.ensurePublishJobWorkspaceID(ctx, &job); err != nil {
+		if errors.Is(err, errPublishJobWorkspaceMismatch) {
+			log.Printf("discarding publish job %s because workspace does not match project", job.JobID)
+			if coordinationQueue := s.coordinationQueueOrDefault(); coordinationQueue != nil && job.JobID != uuid.Nil && job.ProjectID != uuid.Nil && strings.TrimSpace(job.Platform) != "" {
+				_ = coordinationQueue.ReleaseLock(context.Background(), publishLockKey(job.ProjectID, job.Platform), job.JobID.String())
+			}
+			return nil
+		}
+		log.Printf("failed to resolve workspace for publish job %s: %v", job.JobID, err)
+		return err
+	}
+	if job.JobID == uuid.Nil || job.ProjectID == uuid.Nil || job.WorkspaceID == uuid.Nil || job.UserID == uuid.Nil || strings.TrimSpace(job.Platform) == "" {
 		log.Printf("discarding invalid publish job: %+v", job)
 		return nil
 	}
@@ -431,6 +451,7 @@ func (s *Service) processPublishJob(ctx context.Context, job PublishJob) error {
 
 	if err := s.recordPublishEvent(models.PublishEvent{
 		PublicationID:  job.PublicationID,
+		WorkspaceID:    job.WorkspaceID,
 		ProjectID:      job.ProjectID,
 		UserID:         job.UserID,
 		Platform:       job.Platform,
@@ -442,7 +463,7 @@ func (s *Service) processPublishJob(ctx context.Context, job PublishJob) error {
 		log.Printf("failed to record publish job %s start event: %v", job.JobID, err)
 	}
 
-	resp, err := s.PublishProjectWithContext(publishCtx, job.ProjectID, job.Platform, &job.UserID, job.ScheduleID)
+	resp, err := s.PublishProjectInWorkspaceWithContext(publishCtx, job.WorkspaceID, job.ProjectID, job.Platform, &job.UserID, job.ScheduleID)
 	if err != nil {
 		if errors.Is(context.Cause(publishCtx), errPublishLockOwnershipLost) {
 			log.Printf("publish job %s stopped because lock ownership was lost", job.JobID)
@@ -451,7 +472,7 @@ func (s *Service) processPublishJob(ctx context.Context, job PublishJob) error {
 		log.Printf("publish job %s failed: %v", job.JobID, err)
 		observeJob(publishJobResultError)
 		cleanupCtx, cancelCleanup := publishCleanupContext(ctx)
-		if markErr := s.lifecycle().MarkFailed(cleanupCtx, job.ProjectID, job.Platform, err.Error()); markErr != nil {
+		if markErr := s.lifecycle().MarkFailedForWorkspace(cleanupCtx, job.WorkspaceID, job.ProjectID, job.Platform, err.Error()); markErr != nil {
 			log.Printf("failed to mark publish job %s as failed: %v", job.JobID, markErr)
 		} else {
 			s.invalidateDashboardCaches(cleanupCtx)
@@ -460,6 +481,7 @@ func (s *Service) processPublishJob(ctx context.Context, job PublishJob) error {
 		cancelCleanup()
 		_ = s.recordPublishEvent(models.PublishEvent{
 			PublicationID:  job.PublicationID,
+			WorkspaceID:    job.WorkspaceID,
 			ProjectID:      job.ProjectID,
 			UserID:         job.UserID,
 			Platform:       job.Platform,
@@ -480,6 +502,7 @@ func (s *Service) processPublishJob(ctx context.Context, job PublishJob) error {
 		observeJob(publishJobResultError)
 		_ = s.recordPublishEvent(models.PublishEvent{
 			PublicationID:  job.PublicationID,
+			WorkspaceID:    job.WorkspaceID,
 			ProjectID:      job.ProjectID,
 			UserID:         job.UserID,
 			Platform:       job.Platform,
@@ -496,6 +519,7 @@ func (s *Service) processPublishJob(ctx context.Context, job PublishJob) error {
 	}
 	_ = s.recordPublishEvent(models.PublishEvent{
 		PublicationID:  job.PublicationID,
+		WorkspaceID:    job.WorkspaceID,
 		ProjectID:      job.ProjectID,
 		UserID:         job.UserID,
 		Platform:       job.Platform,
@@ -514,6 +538,40 @@ func (s *Service) processPublishJob(ctx context.Context, job PublishJob) error {
 	return nil
 }
 
+func (s *Service) ensurePublishJobWorkspaceID(ctx context.Context, job *PublishJob) error {
+	if job == nil {
+		return nil
+	}
+	if job.ProjectID == uuid.Nil {
+		if job.UserID != uuid.Nil {
+			job.WorkspaceID = models.PersonalWorkspaceID(job.UserID)
+		}
+		return nil
+	}
+
+	queryCtx := ctx
+	if queryCtx == nil || queryCtx.Err() != nil {
+		queryCtx = s.requestContext()
+	}
+	var project models.Project
+	err := s.writerDB(queryCtx).Select("id", "user_id", "workspace_id").First(&project, "id = ?", job.ProjectID).Error
+	if err == nil {
+		projectWorkspaceID := models.ProjectWorkspaceID(project)
+		if job.WorkspaceID != uuid.Nil && job.WorkspaceID != projectWorkspaceID {
+			return errPublishJobWorkspaceMismatch
+		}
+		job.WorkspaceID = projectWorkspaceID
+		return nil
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		if job.UserID != uuid.Nil {
+			job.WorkspaceID = models.PersonalWorkspaceID(job.UserID)
+		}
+		return nil
+	}
+	return err
+}
+
 func (s *Service) ensurePublishJobLock(ctx context.Context, job PublishJob, lockKey string) (bool, error) {
 	coordinationQueue := s.coordinationQueueOrDefault()
 	if coordinationQueue == nil {
@@ -530,7 +588,7 @@ func (s *Service) ensurePublishJobLock(ctx context.Context, job PublishJob, lock
 		return false, nil
 	}
 
-	retriable, err := s.publicationRetriableForJob(job.ProjectID, job.Platform)
+	retriable, err := s.publicationRetriableForJob(job.WorkspaceID, job.ProjectID, job.Platform)
 	if err != nil {
 		return false, err
 	}
@@ -585,9 +643,13 @@ func (s *Service) preparePublishJob(ctx context.Context, projectID uuid.UUID, pl
 	if err != nil {
 		return models.Project{}, models.ProjectPlatformPublication{}, ErrForbidden
 	}
+	return s.preparePublishJobForProject(ctx, project, platform, userID)
+}
 
+func (s *Service) preparePublishJobForProject(ctx context.Context, project models.Project, platform string, userID uuid.UUID) (models.Project, models.ProjectPlatformPublication, error) {
 	var pub models.ProjectPlatformPublication
-	if err := s.strongReadDB(ctx).Where("project_id = ? AND platform = ?", projectID, platform).First(&pub).Error; err != nil {
+	workspaceID := models.ProjectWorkspaceID(project)
+	if err := s.strongReadDB(ctx).Where("workspace_id = ? AND project_id = ? AND platform = ?", workspaceID, project.ID, platform).First(&pub).Error; err != nil {
 		return models.Project{}, models.ProjectPlatformPublication{}, fmt.Errorf("publication record not found for platform: %s", platform)
 	}
 	if !pub.Enabled || pub.Status == models.PublicationStatusCancelled {
@@ -614,9 +676,9 @@ func (s *Service) preparePublishJob(ctx context.Context, projectID uuid.UUID, pl
 	return project, pub, nil
 }
 
-func (s *Service) publicationRetriableForJob(projectID uuid.UUID, platform string) (bool, error) {
+func (s *Service) publicationRetriableForJob(workspaceID uuid.UUID, projectID uuid.UUID, platform string) (bool, error) {
 	var pub models.ProjectPlatformPublication
-	if err := s.writerDB(s.requestContext()).Select("enabled", "status").Where("project_id = ? AND platform = ?", projectID, platform).First(&pub).Error; err != nil {
+	if err := s.writerDB(s.requestContext()).Select("enabled", "status").Where("workspace_id = ? AND project_id = ? AND platform = ?", workspaceID, projectID, platform).First(&pub).Error; err != nil {
 		return false, err
 	}
 	if !pub.Enabled || pub.Status == models.PublicationStatusCancelled {
