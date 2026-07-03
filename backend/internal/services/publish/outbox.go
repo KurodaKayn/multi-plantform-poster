@@ -151,7 +151,10 @@ func (s *Service) dispatchClaimedOutboxEvent(ctx context.Context, event models.O
 	if err := json.Unmarshal(event.Payload, &job); err != nil {
 		return fmt.Errorf("decode publish outbox payload: %w", err)
 	}
-	if job.JobID == uuid.Nil || job.ProjectID == uuid.Nil || job.UserID == uuid.Nil || job.Platform == "" {
+	if err := s.ensurePublishJobWorkspaceID(ctx, &job); err != nil {
+		return fmt.Errorf("resolve publish outbox workspace for event %s: %w", event.ID, err)
+	}
+	if job.JobID == uuid.Nil || job.ProjectID == uuid.Nil || job.WorkspaceID == uuid.Nil || job.UserID == uuid.Nil || job.Platform == "" {
 		return fmt.Errorf("invalid publish outbox payload for event %s", event.ID)
 	}
 	return s.queue.Enqueue(ctx, job)

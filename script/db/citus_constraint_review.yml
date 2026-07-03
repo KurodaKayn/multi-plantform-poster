@@ -1,0 +1,143 @@
+version: 1
+distribution_key: workspace_id
+review_scope:
+  models:
+    - backend/internal/models/models.go
+    - backend/internal/models/collab.go
+    - backend/internal/models/ai.go
+    - backend/internal/models/ai_quota.go
+  table_group_manifest: script/db/citus_table_groups.yml
+unique_constraints:
+  reviewed_ready:
+    - table: workspaces
+      current_constraints:
+        - PRIMARY KEY (id)
+      reason: The root tenant table is distributed by id, so the primary key includes the distribution value.
+    - table: workspace_members
+      current_constraints:
+        - PRIMARY KEY (workspace_id, user_id)
+      reason: The member primary key already includes workspace_id.
+    - table: workspace_dashboard_stats
+      current_constraints:
+        - PRIMARY KEY (workspace_id)
+      reason: The read-model row is keyed by workspace_id.
+    - table: workspace_quota_aggregates
+      current_constraints:
+        - PRIMARY KEY (workspace_id)
+      reason: The quota aggregate row is keyed by workspace_id.
+  requires_refactor:
+    - table: projects
+      current_constraints:
+        - PRIMARY KEY (id)
+        - UNIQUE (collab_document_id)
+      required_change: Use a Citus-safe tenant key such as (workspace_id, id), and move collab-document uniqueness to a workspace-scoped invariant.
+    - table: project_platform_publications
+      current_constraints:
+        - PRIMARY KEY (id)
+        - UNIQUE (project_id, platform)
+      required_change: Include workspace_id in the primary and project/platform uniqueness strategy.
+    - table: project_list_summaries
+      current_constraints:
+        - PRIMARY KEY (project_id)
+      required_change: Include workspace_id in the summary key or make it dependent on a colocated projects key.
+    - table: project_share_links
+      current_constraints:
+        - PRIMARY KEY (id)
+        - UNIQUE (token_hash)
+      required_change: Keep token uniqueness in a control-domain lookup table or make the token invariant workspace-scoped.
+    - table: workspace_invites
+      current_constraints:
+        - PRIMARY KEY (id)
+        - UNIQUE (token_hash)
+      required_change: Keep invite token uniqueness in a control-domain lookup table or make the token invariant workspace-scoped.
+    - table: media_assets
+      current_constraints:
+        - PRIMARY KEY (id)
+        - UNIQUE (object_key)
+      required_change: Include workspace routing in the metadata key or keep object-key uniqueness in object storage/control metadata.
+    - table: media_asset_usages
+      current_constraints:
+        - PRIMARY KEY (id)
+        - UNIQUE (media_asset_id, resource_type, resource_id)
+      required_change: Include workspace_id in the asset/resource uniqueness strategy.
+    - table: extension_callback_tokens
+      current_constraints:
+        - PRIMARY KEY (id)
+        - UNIQUE (token)
+      required_change: Keep token uniqueness in a control-domain lookup table or make the token invariant workspace-scoped.
+    - table: extension_execution_event_claims
+      current_constraints:
+        - PRIMARY KEY (event_id)
+        - UNIQUE (record_id)
+      required_change: Keep as control-domain idempotency state until claims carry workspace routing.
+partitioned_tables:
+  require_workspace_partition_strategy:
+    - table: publish_events
+      current_primary_key: [id, created_at]
+    - table: extension_execution_events
+      current_primary_key: [id, created_at]
+    - table: project_activities
+      current_primary_key: [id, created_at]
+    - table: workspace_activities
+      current_primary_key: [id, created_at]
+    - table: collab_document_update_batches
+      current_primary_key: [id, document_id]
+      note: Existing document_id hash partitioning must be rehearsed with Citus and workspace-compatible uniqueness.
+foreign_keys:
+  colocated_ready:
+    - child: workspace_members.workspace_id
+      parent: workspaces.id
+    - child: workspace_dashboard_stats.workspace_id
+      parent: workspaces.id
+    - child: workspace_quota_aggregates.workspace_id
+      parent: workspaces.id
+  reference_table_dependencies:
+    - parent_table: users
+      reason: Owner, actor, author, recipient, and creator references cross many tenant tables; first Citus validation should treat users as a reference-table candidate.
+  control_domain_boundaries:
+    - tables: [platform_accounts, platform_account_grants]
+      reason: Credential ownership remains user/platform scoped and platform_accounts.workspace_id is nullable.
+    - tables: [outbox_events]
+      reason: Dispatch state remains coordinator-owned; publish job payloads now carry workspace_id for worker routing.
+  deferred_until_workspace_key:
+    - project_collaborators
+    - collab_document_collaborators
+    - publish_attempts
+    - ai_drafting_messages
+    - ai_tool_calls
+    - ai_drafting_session_summaries
+    - ai_session_events
+cross_tenant_joins:
+  shard_local:
+    - query_family: workspace project lists
+      rule: Filter by projects.workspace_id before joining project publications or summaries.
+    - query_family: project experience views
+      rule: Use workspace_id plus project_id when reading comments, versions, activity, share links, and media usage.
+    - query_family: publishing state transitions
+      rule: Carry workspace_id in publish jobs and scheduled-publication rows before loading project/publication state.
+  reference_or_control:
+    - query_family: user identity preloads
+      rule: Use users as a reference-table candidate, or denormalize display fields into read models if reference-table replication is rejected.
+    - query_family: platform account resolution
+      rule: Keep credential/account joins in the control domain until accounts become non-null workspace assets.
+  aggregate_offline:
+    - query_family: cross-workspace admin statistics
+      rule: Build read models, CDC consumers, or offline warehouse queries instead of making cross-tenant joins a hot request path.
+  prohibited_core_paths:
+    - Cross-workspace write transactions.
+    - Project/publication lookups by project_id alone in worker entry points.
+    - Distributed-table foreign keys that do not include compatible workspace routing.
+worker_payloads:
+  tenant_routed:
+    - task_type: publish:project
+      payload_field: workspace_id
+      producers:
+        - backend/internal/services/publish/queue.go
+        - backend/internal/services/publish/schedule.go
+      replay_paths:
+        - backend/internal/services/publish/outbox.go
+  not_tenant_scoped:
+    - task_type: email:code
+      reason: Email verification and password reset jobs do not read or write tenant project-domain rows.
+    - task_type: readmodel:dashboard:rebuild
+      reason: Full dashboard rebuild is a global maintenance task with no single workspace owner.
